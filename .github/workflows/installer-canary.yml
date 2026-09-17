@@ -38,8 +38,11 @@ jobs:
       fail-fast: false
       matrix:
         # Apple Silicon and Intel: the installer picks a different artifact on each, and `varsafe
-        # update` must pick the same one. macos-13 is the last Intel image GitHub hosts.
-        os: [macos-latest, macos-13]
+        # update` must pick the same one. The `macos-13` label was retired in December 2025 and its
+        # jobs sit queued forever rather than failing, which left every run permanently pending — a
+        # canary that never concludes. `macos-15-intel` is the replacement, and GitHub retires
+        # x86_64 macOS entirely after the macOS 15 image (Fall 2027), so this row has a shelf life.
+        os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -61,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-13]
+        os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       # Deliberately no checkout: this job must use exactly what a user gets, from the CDN, with

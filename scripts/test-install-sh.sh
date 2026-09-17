@@ -235,9 +235,14 @@ check "unset HOME does not raw-abort" not grep -q "unbound variable" <<<"$out"
 # script(1) provides the PTY; the pipe inside carries the real installer bytes.
 if command -v script >/dev/null 2>&1; then
   home="$WORK/home-pty"; mkdir -p "$home"
-  out=$(printf 'n\n' | script -qec \
-    "sh -c 'cat \"$REPO_ROOT/install.sh\" | HOME=\"$home\" VARSAFE_INSTALL_DIR=\"$WORK/unwritable\" bash'" \
-    /dev/null 2>&1)
+  # `script` is not one program: GNU takes `-qec CMD FILE`, BSD (macOS) takes `-q FILE CMD...`.
+  # Using the GNU spelling on macOS fails the case and reads as an installer defect.
+  pty_command="sh -c 'cat \"$REPO_ROOT/install.sh\" | HOME=\"$home\" VARSAFE_INSTALL_DIR=\"$WORK/unwritable\" bash'"
+  if script --version 2>&1 | grep -qi util-linux; then
+    out=$(printf 'n\n' | script -qec "$pty_command" /dev/null 2>&1)
+  else
+    out=$(printf 'n\n' | script -q /dev/null sh -c "$pty_command" 2>&1)
+  fi
   check "pipe+PTY shape reaches the /dev/tty offer" grep -aq "instead" <<<"$out"
   check "declining the offer refuses without installing" \
     not test -e "$home/.varsafe/bin/varsafe"
@@ -392,11 +397,18 @@ check "the default install dir stays \$HOME-relative in the rc file" \
 # The key baked into install.sh must be the one `varsafe update` verifies against. A drift here
 # downgrades every FIRST install to unverified while the updater still looks correct.
 install_key=$(sed -n 's/^RELEASE_SIGNING_PUBLIC_KEY="\(.*\)"$/\1/p' "$REPO_ROOT/install.sh")
-cli_key=$(sed -n "s/^export const RELEASE_SIGNING_PUBLIC_KEY = '\(.*\)';$/\1/p" \
-  "$REPO_ROOT/packages/cli/src/system/release-signature.ts")
 check "installer pins a release signing key" test -n "$install_key"
-check "installer key matches the key the CLI updater verifies against" \
-  test "$install_key" = "$cli_key"
+# The updater's copy of the key lives in the CLI source, which the public installer repository
+# deliberately does not carry. Assert it where both halves exist, and say why where they do not —
+# the private pipeline runs this suite with REQUIRE_FULL_COVERAGE, so the skip fails there.
+cli_key_source="$REPO_ROOT/packages/cli/src/system/release-signature.ts"
+if [[ ! -f "$cli_key_source" ]]; then
+  skip "installer/updater key match: the CLI source is not part of this repository"
+else
+  cli_key=$(sed -n "s/^export const RELEASE_SIGNING_PUBLIC_KEY = '\(.*\)';$/\1/p" "$cli_key_source")
+  check "installer key matches the key the CLI updater verifies against" \
+    test "$install_key" = "$cli_key"
+fi
 
 # The payload every fixture describes, and the manifest that names its checksum — built WITHOUT
 # openssl, so a host whose openssl cannot sign Ed25519 can still exercise the SSHSIG verifier.

@@ -1,0 +1,96 @@
+name: installer gate
+
+# The run name carries the caller's correlation id, because `workflow_dispatch` does not return a
+# run id: the release pipeline dispatches, then finds its run by matching this name.
+run-name: ${{ inputs.correlation || 'scheduled' }} — varsafe ${{ inputs.version || 'latest' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to install (blank installs whatever latest points at)
+        required: false
+        type: string
+      correlation:
+        description: Caller-supplied id, echoed in the run name so a pipeline can find this run
+        required: false
+        type: string
+  push:
+    branches: [main]
+  schedule:
+    # A weekly canary. The installer depends on what the OS ships — an OpenSSH or LibreSSL change on
+    # macOS can break installs with no commit on our side, and nobody would know until a user tried.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: test suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple Silicon and Intel: the installer picks a different artifact on each, and `varsafe
+        # update` must pick the same one. macos-13 is the last Intel image GitHub hosts.
+        os: [macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: what this machine actually ships
+        run: |
+          sw_vers
+          uname -m
+          echo "openssl: $(openssl version)"
+          echo "openssh: $(ssh -V 2>&1)"
+          # Expected on stock macOS: LibreSSL (cannot verify Ed25519) + OpenSSH (can, via SSHSIG).
+          # If that ever flips, the suite below says so rather than silently changing which path ran.
+
+      - name: installer test suite
+        run: bash scripts/test-install-sh.sh
+
+  install:
+    name: install from varsafe.dev (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Deliberately no checkout: this job must use exactly what a user gets, from the CDN, with
+      # nothing from this repository on disk.
+      - name: install
+        env:
+          # Through the environment, never interpolated into the script: a dispatch input is
+          # attacker-shaped data as far as this runner is concerned.
+          VARSAFE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VARSAFE_VERSION:-}" ]; then
+            echo "installing pinned v${VARSAFE_VERSION}"
+          else
+            unset VARSAFE_VERSION || true
+            echo "installing whatever latest points at"
+          fi
+          curl -fsSL https://varsafe.dev/install.sh | bash
+
+      - name: it runs, and reports the version that was asked for
+        env:
+          EXPECTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          INSTALLED=$("$HOME/.varsafe/bin/varsafe" --version | tr -d '[:space:]')
+          echo "installed: $INSTALLED"
+          if [ -n "${EXPECTED:-}" ] && [ "$INSTALLED" != "$EXPECTED" ]; then
+            echo "::error::installed $INSTALLED but $EXPECTED was requested"
+            exit 1
+          fi
+
+      - name: doctor (keychain round-trip)
+        run: |
+          set -euo pipefail
+          # The half no Linux runner can check: the CLI stores its credential key in the OS keychain
+          # through a native addon, and a packaging defect there shipped three releases that could
+          # not log in.
+          "$HOME/.varsafe/bin/varsafe" doctor

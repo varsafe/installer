@@ -1,18 +1,24 @@
-name: installer gate
+name: installer canary
 
-# The run name carries the caller's correlation id, because `workflow_dispatch` does not return a
-# run id: the release pipeline dispatches, then finds its run by matching this name.
-run-name: ${{ inputs.correlation || 'scheduled' }} — varsafe ${{ inputs.version || 'latest' }}
+# CANARY, NOT A RELEASE GATE — deliberately.
+#
+# This workflow runs in a PUBLIC repository, so anyone with write access here could change what it
+# asserts, and the install job downloads and executes whatever varsafe.dev is currently serving. A
+# verdict produced under those conditions can be manufactured by someone who controls this repo or
+# the CDN, which is precisely the pair a release gate is supposed to protect against. Promotion
+# authority stays in the private pipeline, which installs the artifacts it just built, from the
+# installer in the tag, verified against the signing key compiled into the CLI.
+#
+# What this is for: telling us that a release users can reach stopped installing on macOS — a
+# machine class the private pipeline cannot run at all — including when nothing of ours changed and
+# an OS update moved OpenSSH or LibreSSL under us.
+run-name: varsafe ${{ inputs.version || 'latest' }} — macOS canary
 
 on:
   workflow_dispatch:
     inputs:
       version:
         description: Version to install (blank installs whatever latest points at)
-        required: false
-        type: string
-      correlation:
-        description: Caller-supplied id, echoed in the run name so a pipeline can find this run
         required: false
         type: string
   push:
@@ -60,6 +66,9 @@ jobs:
     steps:
       # Deliberately no checkout: this job must use exactly what a user gets, from the CDN, with
       # nothing from this repository on disk.
+      # A compromised CDN could serve a script that plants a shim answering both checks below, so
+      # these prove "a user can install and run it today", never "this release is authentic".
+      # Authenticity is established in the private pipeline against the pinned signing key.
       - name: install
         env:
           # Through the environment, never interpolated into the script: a dispatch input is

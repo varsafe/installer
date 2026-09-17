@@ -56,6 +56,14 @@ no openssl that can sign Ed25519 for the fixtures) reports as `skip` with the re
 pass. CI runs the suite on macOS (arm64 and Intel) here, and on Debian, Ubuntu 20.04, Alpine and
 Fedora in the private pipeline.
 
+The macOS workflow here is a **canary, not a release gate**: it runs in a public repository and it
+executes whatever varsafe.dev currently serves, so its verdict cannot be evidence that a release is
+authentic. Whether a release may be promoted is decided in varsafe's private pipeline, which
+installs the artifacts it just built using the installer from that tag and verifies them against the
+signing key compiled into the CLI. What this workflow is good for is noticing that an install users
+can reach broke on macOS — including when nothing of ours changed and an OS update moved OpenSSH or
+LibreSSL underneath it.
+
 ## Reporting a problem
 
 Security issues: security@varsafe.dev. Everything else: https://docs.varsafe.dev.

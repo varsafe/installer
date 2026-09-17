@@ -1,0 +1,6 @@
+.github/workflows/installer-canary.yml
+LICENSE
+MANIFEST
+README.md
+install.sh
+scripts/test-install-sh.sh

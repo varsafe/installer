@@ -202,6 +202,10 @@ home="$WORK/home-umask"; mkdir -p "$home"
 out=$( (umask 002; scenario "$home" "") )
 check "under a group-writable umask, a new ~/.varsafe is created private" \
   test "$(file_mode "$home/.varsafe")" = "700"
+# Including when HOME itself does not exist yet, which would otherwise fall through to `mkdir -p`.
+home="$WORK/home-not-yet/inner"
+out=$( (umask 002; scenario "$home" "") )
+check "and when HOME does not exist yet" test "$(file_mode "$home/.varsafe")" = "700"
 # Anything already at ~/.varsafe is not the installer's to change — a symlink least of all, since
 # a chmod would follow it — and the CLI tightens its own directory when it first opens it.
 home="$WORK/home-symlinked-root"; mkdir -p "$home" "$WORK/shared-varsafe"
@@ -785,7 +789,7 @@ fake_cdn "$no_sha_box"
 out=$( ( PATH="$no_sha_box"; export HOME="$WORK/home-no-sha"
   unset VARSAFE_INSTALL_DIR; "$BASH" "$REPO_ROOT/install.sh" ) </dev/null 2>&1 )
 check "a machine with no SHA-256 tool is told so before anything is downloaded" \
-  grep -q "sha256sum or shasum is required" <<<"$out"
+  grep -q "Neither sha256sum nor shasum found" <<<"$out"
 check "and nothing was requested" test ! -s "$no_sha_box/requests"
 
 # ---------------------------------------------------------------------------
@@ -909,6 +913,30 @@ box=$(platform_box "$WORK/box-getconf-blank" Linux x86_64 musl)
 printf '#!/bin/sh\nexit 0\n' > "$box/getconf"
 check "a getconf that succeeds without naming glibc does not outvote ldd's musl" \
   test "$(detected_with_fs "$box" 1)" = "linux-x64-musl"
+
+# The x64 builds need x86-64-v2 (SSSE3, SSE4.1, SSE4.2, POPCNT). Measured under QEMU: the binary
+# runs on a Westmere model (no AVX at all) and crashes on the bare qemu64 model — SIGILL without
+# POPCNT or SSSE3, SIGSEGV without SSE4.2 — which is what VMs on qemu64/kvm64 CPU types are.
+printf 'processor\t: 0\nflags\t\t: fpu sse sse2 pni ssse3 cx16 sse4_1 sse4_2 popcnt aes lahf_lm\n' > "$WORK/cpuinfo-westmere"
+printf 'processor\t: 0\nflags\t\t: fpu sse sse2 pni cx16 lahf_lm hypervisor\n' > "$WORK/cpuinfo-qemu64"
+printf 'processor\t: 0\nflags\t\t: fpu sse sse2 pni ssse3 sse4_1 sse4_2 lahf_lm\n' > "$WORK/cpuinfo-no-popcnt"
+cpu_ok() { ( . "$REPO_ROOT/install.sh"; x64_cpu_supported "$1" ) >/dev/null 2>&1; }
+check "an x86-64-v2 CPU without AVX (Westmere) is supported" cpu_ok "$WORK/cpuinfo-westmere"
+check "the bare qemu64/kvm64 CPU model is not" not cpu_ok "$WORK/cpuinfo-qemu64"
+check "nor a CPU with SSE4.2 but no POPCNT" not cpu_ok "$WORK/cpuinfo-no-popcnt"
+check "an unreadable cpuinfo counts as capable" cpu_ok "$WORK/no-such-cpuinfo"
+# cpuinfo only EXPLAINS a crash; it never refuses up front (a container can show a filtered one on a
+# CPU that runs varsafe — the end-to-end cases below install with it reporting no flags at all).
+printf '#!/bin/sh\nkill -ILL $$\n' > "$WORK/sigill-bin"; chmod +x "$WORK/sigill-bin"
+crash_hint() {
+  ( fs_answer="$2"; . "$REPO_ROOT/install.sh"; x64_cpu_supported() { return "$fs_answer"; }
+    smoke_test_binary "$WORK/sigill-bin" "$1" ) </dev/null 2>&1
+}
+check "an x64 binary killed by SIGILL on a CPU without x86-64-v2 names the CPU and the VM fix" \
+  grep -q "instead of qemu64/kvm64" <<<"$(crash_hint linux-x64 1)"
+check "on a CPU that has those instructions the crash is not blamed on it" \
+  not grep -q "x86-64-v2" <<<"$(crash_hint linux-x64 0)"
+check "nor is an arm64 crash" not grep -q "x86-64-v2" <<<"$(crash_hint linux-arm64 1)"
 
 # A terminal running under Rosetta 2 on Apple silicon reports x86_64; the native build is wanted,
 # because `varsafe update` would otherwise keep the translated one for good.
@@ -1203,6 +1231,13 @@ else
   out=$(e2e_run "$home" "$e2e/cdn"); rc=$?
   check "re-running over an install succeeds" test "$rc" -eq 0
   check "and leaves exactly one PATH line" test "$(grep -c '.varsafe/bin' "$home/.bashrc")" = "1"
+
+  # A cpuinfo that reports none of the x86-64-v2 flags (a filtered one, in a container) on a CPU
+  # whose binary runs fine: no refusal, because what decides is whether the binary runs.
+  out=$( ( export HOME="$WORK/e2e-cpuinfo" SHELL=/bin/bash TMPDIR="$e2e/tmp"; mkdir -p "$HOME"
+    unset VARSAFE_INSTALL_DIR VARSAFE_VERSION ZDOTDIR; PATH="$e2e/cdn:$e2e/tools:$PATH"
+    . "$e2e_installer"; x64_cpu_supported() { return 1; }; main ) </dev/null 2>&1 ); rc=$?
+  check "a CPU whose cpuinfo omits the flags still installs when the binary runs" test "$rc" -eq 0
 
   # `curl … | sh` on macOS runs this file in /bin/sh — bash in POSIX mode, where echo honours
   # backslashes and takes no options, so every `echo -e` message began with a literal "-e".

@@ -179,6 +179,19 @@ detect_platform() {
   echo "${os}-${arch}"
 }
 
+# varsafe's x64 builds need an x86-64-v2 CPU — SSSE3, SSE4.1, SSE4.2, POPCNT, which every Intel and
+# AMD CPU since about 2010 has. Without one the binary crashes on start (SIGILL, or SIGSEGV for a
+# missing SSE4.2): what a VM on the bare qemu64/kvm64 CPU model shows. Used only to EXPLAIN such a
+# crash, never to refuse up front: cpuinfo is an inventory, and a container can show a filtered one
+# on a CPU that runs varsafe fine. Whether the binary runs is the smoke test's verdict.
+x64_cpu_supported() {
+  local flags flag
+  flags=$(grep -m1 '^flags' "$1" 2>/dev/null) || return 0
+  for flag in ssse3 sse4_1 sse4_2 popcnt; do
+    case " $flags " in *" $flag "*) ;; *) return 1 ;; esac
+  done
+}
+
 # The musl binaries dynamically link libstdc++.so.6 and libgcc_s.so.1. That comes from Bun's own
 # musl runtime — `bun build --compile` bolts our bundle onto a prebuilt runtime, and upstream
 # publishes no statically-linked musl build — so it cannot be removed on our side. Stock Alpine
@@ -281,18 +294,15 @@ $(echo "$out" | sed 's/^/    /')
   # The status is a hint, not a diagnosis: a program can return any code. 127 is what the shell
   # reports when the kernel cannot even start the file — its loader is missing.
   local hint=""
-  if [[ $status -eq 127 ]]; then
-    hint="
-
-  Possible cause: this system cannot load ${platform} binaries — for example a
-  32-bit OS on a 64-bit CPU (uname -m reports $(uname -m)), or an unsupported C library."
-  elif [[ $status -gt 128 ]]; then
-    hint="
-
-  It was killed by signal $((status - 128))."
+  [[ $status -eq 127 ]] && hint="Possible cause: this system cannot load ${platform} binaries, e.g. a 32-bit OS on a 64-bit CPU (uname -m: $(uname -m))."
+  [[ $status -gt 128 ]] && hint="It was killed by signal $((status - 128))."
+  if [[ $status -gt 128 && "$platform" == linux-x64* ]] && ! x64_cpu_supported /proc/cpuinfo; then
+    hint="$hint This CPU lacks the x86-64-v2 instructions varsafe's x64 build needs (SSSE3, SSE4.1, SSE4.2, POPCNT).
+  On a virtual machine, set a CPU type of x86-64-v2 or newer, or host, instead of qemu64/kvm64."
   fi
   error "The downloaded binary did not run on this system:
-$(echo "$out" | sed 's/^/    /')${hint}"
+$(echo "$out" | sed 's/^/    /')
+  ${hint}"
 }
 
 # Every transfer, with one policy:
@@ -330,14 +340,6 @@ compute_sha256() {
   else
     error "Neither sha256sum nor shasum found; cannot verify download integrity"
   fi
-}
-
-# The download can only be checked with a SHA-256 tool, so find out before fetching 90 MB. (A
-# missing curl/wget surfaces on the first, tiny download; whether this machine can verify a
-# signature depends on the release, so verify_manifest decides that — also before the binary.)
-require_sha256_tool() {
-  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
-    error "sha256sum or shasum is required to check the download"
 }
 
 # Base64 of the raw 32-byte Ed25519 release-signing public key.
@@ -459,10 +461,7 @@ This is what a tampered download looks like. Refusing to install."
 
     local openssl_bin="" candidate
     for candidate in openssl openssl3; do
-      if openssl_can_verify_ed25519 "$candidate" "${WORK_DIR}/pub.pem"; then
-        openssl_bin="$candidate"
-        break
-      fi
+      openssl_can_verify_ed25519 "$candidate" "${WORK_DIR}/pub.pem" && { openssl_bin="$candidate"; break; }
     done
 
     # No capable verifier is NOT evidence of tampering, and saying so sent every stock-macOS user a
@@ -553,11 +552,6 @@ Use a released version such as VARSAFE_VERSION=7.2.32 (no leading v), or leave i
   printf '%s' "$version"
 }
 
-# Check if running interactively
-is_interactive() {
-  [[ -t 0 && -t 1 ]]
-}
-
 # Can we create (if needed) and actually write into "$1"? Probes with a real file
 # rather than `test -w` — permission bits lie on NFS (root_squash), ACLs, and
 # read-only mounts, and mkdir -p on an EXISTING unwritable dir succeeds silently.
@@ -621,13 +615,10 @@ ensure_install_dir() {
   # which no quoting protects. And none of the characters a double-quoted rc line would expand or
   # end on — the rc file is shell code, run at every login.
   case "$INSTALL_DIR" in
+    *[\"\$\`\\:]*|*"
+"*) error "The install directory '$INSTALL_DIR' cannot be put on PATH: it contains one of : \" \$ \` \\ or a newline. Choose another with VARSAFE_INSTALL_DIR." ;;
     /*) ;;
     *) error "The install directory must be an absolute path, not '$INSTALL_DIR'. Set VARSAFE_INSTALL_DIR to a full path, e.g. \$HOME/bin." ;;
-  esac
-  case "$INSTALL_DIR" in
-    *[\"\$\`\\:]*|*"
-"*)
-      error "The install directory '$INSTALL_DIR' cannot be put on PATH: it contains one of : \" \$ \` \\ or a newline. Choose another with VARSAFE_INSTALL_DIR." ;;
   esac
 
   # `curl … | sudo bash` keeps the invoking user's HOME on macOS, whose sudoers keeps it, and under
@@ -644,10 +635,14 @@ ensure_install_dir() {
   # ~/.varsafe is the CLI's own directory, kept 0700 because it holds the credential store — but
   # only once the CLI first opens it. Created here with the umask's permissions, it let anyone in a
   # shared group swap the directory holding the binary before varsafe ever ran. `mkdir -m` creates
-  # it private in one step, and fails on anything already there, a symlink included: nothing is
-  # chmodded through a path that could be swapped between a check and the change.
+  # it private in one step and leaves anything already there alone, a symlink included: nothing is
+  # chmodded through a path that could be swapped between a check and the change. HOME first, so a
+  # HOME that does not exist yet does not leave it to the umask-mode `mkdir -p` below.
   if [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" ]]; then
-    mkdir -m 700 "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+    local varsafe_home
+    varsafe_home=$(dirname "$INSTALL_DIR")
+    mkdir -p "$(dirname "$varsafe_home")" 2>/dev/null || true
+    mkdir -m 700 "$varsafe_home" 2>/dev/null || true
   fi
 
   if dir_writable "$INSTALL_DIR"; then
@@ -689,7 +684,7 @@ prompt_yes_no() {
   local prompt="$1"
   local response
 
-  if ! is_interactive; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
     return 0  # Default to yes in non-interactive mode
   fi
 
@@ -761,7 +756,9 @@ rc_has_install_dir() {
   [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" ]] || return 1
   # Split at the characters that delimit a PATH entry, so only a whole entry can match.
   words=$(tr '=:"'"'"'()[:space:]' '\n' <<<"$lines")
-  grep -qxF -e "$INSTALL_DIR" -e '$HOME/.varsafe/bin' -e '${HOME}/.varsafe/bin' -e '~/.varsafe/bin' <<<"$words"
+  local prefix spellings=(-e "$INSTALL_DIR")
+  for prefix in '$HOME' '${HOME}' '~'; do spellings+=(-e "$prefix/.varsafe/bin"); done
+  grep -qxF "${spellings[@]}" <<<"$words"
 }
 
 # Configure PATH
@@ -854,7 +851,8 @@ main() {
       ;;
   esac
 
-  require_sha256_tool
+  # The download can only be checked with a SHA-256 tool: find out now, not after fetching 90 MB.
+  compute_sha256 /dev/null >/dev/null
 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/varsafe-install.XXXXXX")" ||
     error "Could not create a temporary directory in ${TMPDIR:-/tmp}"

@@ -928,10 +928,13 @@ check "an unreadable cpuinfo counts as capable" cpu_ok "$WORK/no-such-cpuinfo"
 # cpuinfo only EXPLAINS a crash; it never refuses up front (a container can show a filtered one on a
 # CPU that runs varsafe — the end-to-end cases below install with it reporting no flags at all).
 printf '#!/bin/sh\nkill -ILL $$\n' > "$WORK/sigill-bin"; chmod +x "$WORK/sigill-bin"
+printf '#!/bin/sh\nkill -TERM $$\n' > "$WORK/sigterm-bin"; chmod +x "$WORK/sigterm-bin"
 crash_hint() {
   ( fs_answer="$2"; . "$REPO_ROOT/install.sh"; x64_cpu_supported() { return "$fs_answer"; }
-    smoke_test_binary "$WORK/sigill-bin" "$1" ) </dev/null 2>&1
+    smoke_test_binary "$WORK/${3:-sigill}-bin" "$1" ) </dev/null 2>&1
 }
+check "a binary killed by SIGTERM is not blamed on the CPU, whatever cpuinfo shows" \
+  not grep -q "x86-64-v2" <<<"$(crash_hint linux-x64 1 sigterm)"
 check "an x64 binary killed by SIGILL on a CPU without x86-64-v2 names the CPU and the VM fix" \
   grep -q "instead of qemu64/kvm64" <<<"$(crash_hint linux-x64 1)"
 check "on a CPU that has those instructions the crash is not blamed on it" \

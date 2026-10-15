@@ -20,14 +20,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
     # whatever the failed attempt already wrote to stdout, and that concatenation would run.
     # wget is for hosts without curl — stock Alpine has only BusyBox's.
     if command -v curl >/dev/null 2>&1; then
-      _varsafe_dl=curl
-      _varsafe_src=$(curl -q -fsSL --proto '=https' https://varsafe.dev/install.sh)
+      _varsafe_dl=curl; _varsafe_src=$(curl -q -fsSL --proto '=https' https://varsafe.dev/install.sh)
     elif command -v wget >/dev/null 2>&1; then
-      _varsafe_dl=wget
-      _varsafe_src=$(wget -qO- https://varsafe.dev/install.sh)
+      _varsafe_dl=wget; _varsafe_src=$(wget -qO- https://varsafe.dev/install.sh)
     else
-      echo "error  this installer needs curl or wget to download itself." >&2
-      exit 1
+      echo "error  this installer needs curl or wget to download itself." >&2; exit 1
     fi
     _varsafe_rc=$?
     if [ "$_varsafe_rc" -ne 0 ]; then
@@ -257,14 +254,9 @@ musl_prereq_help() {
 # moved into place, so a failure never leaves an unusable varsafe on PATH.
 smoke_test_binary() {
   local bin="$1" platform="$2"
-  local out status
-  if out=$("$bin" --version 2>&1); then
-    return 0
-  else
-    # Must be captured HERE: after the `fi`, $? would be the if-statement's
-    # own (zero) status, not the binary's.
-    status=$?
-  fi
+  local out status=0
+  out=$("$bin" --version 2>&1) || status=$?
+  [[ $status -eq 0 ]] && return 0
 
   case "$platform" in
     *-musl)
@@ -296,8 +288,10 @@ $(echo "$out" | sed 's/^/    /')
   local hint=""
   [[ $status -eq 127 ]] && hint="Possible cause: this system cannot load ${platform} binaries, e.g. a 32-bit OS on a 64-bit CPU (uname -m: $(uname -m))."
   [[ $status -gt 128 ]] && hint="It was killed by signal $((status - 128))."
-  if [[ $status -gt 128 && "$platform" == linux-x64* ]] && ! x64_cpu_supported /proc/cpuinfo; then
-    hint="$hint This CPU lacks the x86-64-v2 instructions varsafe's x64 build needs (SSSE3, SSE4.1, SSE4.2, POPCNT).
+  # Only the two crashes a missing instruction produces (SIGILL, SIGSEGV): a SIGTERM or the OOM
+  # killer's SIGKILL says nothing about the CPU.
+  if [[ ($status -eq 132 || $status -eq 139) && "$platform" == linux-x64* ]] && ! x64_cpu_supported /proc/cpuinfo; then
+    hint="$hint Possible cause: this CPU lacks the x86-64-v2 instructions varsafe's x64 build needs (SSSE3, SSE4.1, SSE4.2, POPCNT).
   On a virtual machine, set a CPU type of x86-64-v2 or newer, or host, instead of qemu64/kvm64."
   fi
   error "The downloaded binary did not run on this system:
@@ -488,9 +482,7 @@ Install a verifier and re-run:
         -in "$manifest" -sigfile "${WORK_DIR}/sig.bin" >/dev/null 2>&1; then
       verified=0
     fi
-    if [[ "$verified" -ne 0 ]]; then
-      error "$tampered"
-    fi
+    [[ "$verified" -eq 0 ]] || error "$tampered"
   fi
 
   # Only now is the manifest trustworthy enough to read. Reading it whole is safe at this point:
@@ -504,16 +496,14 @@ Install a verifier and re-run:
   # requested: version.txt and the path are unsigned, so whoever controls the CDN could serve an
   # older, genuinely signed release under a newer path. The signed version binds them, as it does
   # for `varsafe update`. (Nothing here can stop an older release being named as latest.)
-  if [[ "$signed_version" != "$version" ]]; then
+  [[ "$signed_version" == "$version" ]] ||
     error "The signed manifest served for v${version} is for version '${signed_version}'. Refusing to install it."
-  fi
 
   checksum_re="\"${binary_name}\"[[:space:]]*:[[:space:]]*\"([0-9a-f]{64})\""
   EXPECTED_SHA256=""
   if [[ "$content" =~ $checksum_re ]]; then EXPECTED_SHA256="${BASH_REMATCH[1]}"; fi
-  if [[ -z "$EXPECTED_SHA256" ]]; then
+  [[ -n "$EXPECTED_SHA256" ]] ||
     error "The signed manifest for v${version} lists no checksum for ${binary_name}; nothing was installed."
-  fi
 }
 
 # A release version as published: 7.2.32, or a prerelease such as 8.0.0-rc.1. It becomes part of
@@ -583,10 +573,7 @@ prompt_yes_no_tty() {
   # -t 60: a CI runner can allocate a PTY nobody is attached to; without a
   # timeout the read blocks the job forever. Timeout = no, same as no terminal.
   read -r -t 60 response < /dev/tty || return 1
-  case "$response" in
-    [yY]|[yY][eE][sS]) return 0 ;;
-    *) return 1 ;;
-  esac
+  case "$response" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
 # Harden the default directory. chmod is skipped when the path is a symlink:
@@ -690,10 +677,7 @@ prompt_yes_no() {
 
   printf '%s?%s %s %s[Y/n]%s ' "$CYAN" "$NC" "$prompt" "$GREEN" "$NC"
   read -r response
-  case "$response" in
-    [nN]|[nN][oO]) return 1 ;;
-    *) return 0 ;;
-  esac
+  case "$response" in [nN]|[nN][oO]) return 1 ;; *) return 0 ;; esac
 }
 
 # Get shell config file
@@ -701,25 +685,15 @@ get_shell_config() {
   local shell_name
   # No HOME (custom-dir install in a stripped container): there is no rc file
   # to edit — empty return routes configure_path to the manual instructions.
-  if [[ -z "${HOME:-}" ]]; then
-    echo ""
-    return
-  fi
+  if [[ -z "${HOME:-}" ]]; then echo ""; return; fi
   shell_name=$(basename "${SHELL:-/bin/bash}")
 
   case "$shell_name" in
     # zsh reads its rc files from ZDOTDIR when that is set.
     zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
-    bash)
-      # Prefer .bashrc, fall back to .bash_profile on macOS
-      if [[ -f "$HOME/.bashrc" ]]; then
-        echo "$HOME/.bashrc"
-      elif [[ -f "$HOME/.bash_profile" ]]; then
-        echo "$HOME/.bash_profile"
-      else
-        echo "$HOME/.bashrc"
-      fi
-      ;;
+    # .bashrc, unless only .bash_profile exists (what a macOS login shell reads).
+    bash) if [[ -f "$HOME/.bash_profile" && ! -f "$HOME/.bashrc" ]]; then echo "$HOME/.bash_profile"
+          else echo "$HOME/.bashrc"; fi ;;
     fish) echo "$HOME/.config/fish/config.fish" ;;
     *)    echo "" ;;
   esac
@@ -767,18 +741,11 @@ configure_path() {
   shell_name=$(basename "${SHELL:-/bin/bash}")
   shell_rc=$(get_shell_config)
 
-  # Check if already in PATH
-  if command -v varsafe &>/dev/null; then
-    local installed_path
-    installed_path=$(command -v varsafe)
-    if [[ "$installed_path" == "$INSTALL_DIR/varsafe" ]]; then
-      success "varsafe is ready to use!"
-      return 0
-    else
-      warn "Another varsafe found at: $installed_path"
-      warn "The new installation at $INSTALL_DIR/varsafe may be shadowed"
-    fi
-  fi
+  # Already on PATH? Or shadowed by another varsafe earlier in it?
+  local found
+  found=$(command -v varsafe 2>/dev/null || true)
+  if [[ "$found" == "$INSTALL_DIR/varsafe" ]]; then success "varsafe is ready to use!"; return 0; fi
+  [[ -z "$found" ]] || warn "Another varsafe, at $found, comes first on PATH: the new $INSTALL_DIR/varsafe is shadowed"
 
   if [[ -n "$shell_rc" ]] && rc_has_install_dir "$shell_rc" "$shell_name"; then
     info "PATH already configured in $shell_rc"
@@ -807,13 +774,7 @@ add_to_shell_config() {
 
 # Print reload instructions
 print_reload_instructions() {
-  local shell_rc="$1"
-
-  echo ""
-  printf '  %sAlmost there!%s To start using varsafe:\n\n' "$GREEN" "$NC"
-  printf '  %sOption 1:%s Reload your shell config\n' "$CYAN" "$NC"
-  printf '           %ssource %s%s\n\n' "$GREEN" "$shell_rc" "$NC"
-  printf '  %sOption 2:%s Open a new terminal window\n\n' "$CYAN" "$NC"
+  printf '\n  %sAlmost there!%s Open a new terminal, or run: %ssource %s%s\n' "$GREEN" "$NC" "$GREEN" "$1" "$NC"
 }
 
 # Print manual instructions when user declines auto-config, or the shell is one we do not edit.
@@ -828,9 +789,7 @@ print_manual_instructions() {
 }
 
 main() {
-  echo ""
-  echo "  Varsafe CLI Installer"
-  echo ""
+  printf '\n  Varsafe CLI Installer\n\n'
 
   local platform version binary_name download_url
 
@@ -859,11 +818,7 @@ main() {
   trap cleanup EXIT
 
   version=$(resolve_version)
-  if [[ -n "${VARSAFE_VERSION:-}" ]]; then
-    info "Pinned version: v$version"
-  else
-    info "Latest version: v$version"
-  fi
+  info "$([[ -n "${VARSAFE_VERSION:-}" ]] && echo Pinned || echo Latest) version: v$version"
 
   binary_name="varsafe-${platform}"
   download_url="${RELEASES_URL}/v${version}/${binary_name}"
@@ -905,11 +860,7 @@ The signed manifest and the downloaded binary disagree. Refusing to install."
 
   configure_path
 
-  echo ""
-  echo "  Get started:"
-  echo "    varsafe login"
-  echo "    varsafe --help"
-  echo ""
+  printf '\n  Get started:\n    varsafe login\n    varsafe --help\n\n'
 }
 
 # Sourceable for tests: scripts/test-install-sh.sh sources this file to exercise

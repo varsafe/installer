@@ -16,10 +16,22 @@ if [ -z "${BASH_VERSION:-}" ]; then
     # -q FIRST: without it curl reads ~/.curlrc, where a stray `output=` sends the body to a
     # file (leaving stdout empty) and `write-out=` appends text to the script we are about to
     # execute. Ambient user config must not be able to alter or truncate this download.
-    _varsafe_src=$(curl -q -fsSL https://varsafe.dev/install.sh)
+    # No --retry here, unlike every other download below: a retried transfer is appended to
+    # whatever the failed attempt already wrote to stdout, and that concatenation would run.
+    # wget is for hosts without curl — stock Alpine has only BusyBox's.
+    if command -v curl >/dev/null 2>&1; then
+      _varsafe_dl=curl
+      _varsafe_src=$(curl -q -fsSL --proto '=https' https://varsafe.dev/install.sh)
+    elif command -v wget >/dev/null 2>&1; then
+      _varsafe_dl=wget
+      _varsafe_src=$(wget -qO- https://varsafe.dev/install.sh)
+    else
+      echo "error  this installer needs curl or wget to download itself." >&2
+      exit 1
+    fi
     _varsafe_rc=$?
     if [ "$_varsafe_rc" -ne 0 ]; then
-      echo "error  could not download the installer (curl exit $_varsafe_rc)." >&2
+      echo "error  could not download the installer ($_varsafe_dl exit $_varsafe_rc)." >&2
       echo "       Check your connection, then retry:" >&2
       echo "       curl -fsSL https://varsafe.dev/install.sh | bash" >&2
       exit 1
@@ -67,40 +79,68 @@ INSTALL_DIR="${VARSAFE_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 INSTALL_DIR="${INSTALL_DIR%/}"
 [[ -z "$INSTALL_DIR" ]] && INSTALL_DIR="/"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# Scratch space for the release manifest and its signatures, and the binary while it downloads.
+# Set by main; both are removed on every exit — success, refusal or Ctrl-C — so a failed install
+# leaves nothing behind for the next one to trip over.
+WORK_DIR=""
+TMP_BINARY=""
+cleanup() {
+  if [[ -n "$TMP_BINARY" ]]; then rm -f "$TMP_BINARY"; fi
+  if [[ -n "$WORK_DIR" ]]; then rm -rf "$WORK_DIR"; fi
+}
 
-info() { echo -e "${CYAN}info${NC}  $1"; }
-success() { echo -e "${GREEN}success${NC}  $1"; }
-warn() { echo -e "${YELLOW}warn${NC}  $1"; }
-error() { echo -e "${RED}error${NC}  $1"; exit 1; }
+# Colour only for a person at a terminal: CI logs and redirected output get plain text instead of
+# escape codes, and NO_COLOR (https://no-color.org) turns it off everywhere.
+if [[ -t 1 && -t 2 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[1;33m' CYAN=$'\033[0;36m' NC=$'\033[0m'
+else
+  RED='' GREEN='' YELLOW='' CYAN='' NC=''
+fi
+
+# printf, never `echo -e`: macOS's /bin/sh is bash in POSIX mode, whose echo takes no options and
+# prints a literal "-e" — and `curl … | sh` runs there without the re-exec, BASH_VERSION being set.
+#
+# Warnings and errors go to STDERR. Callers such as `platform=$(detect_platform)` capture stdout,
+# so an error printed there was swallowed into the variable and the installer exited 1 having said
+# nothing at all — on its most common failure, the release server being unreachable.
+info() { printf '%sinfo%s  %s\n' "$CYAN" "$NC" "$1"; }
+success() { printf '%ssuccess%s  %s\n' "$GREEN" "$NC" "$1"; }
+warn() { printf '%swarn%s  %s\n' "$YELLOW" "$NC" "$1" >&2; }
+error() { printf '%serror%s  %s\n' "$RED" "$NC" "$1" >&2; exit 1; }
+
+# Last resort for is_musl, when no C library answered: does the filesystem look like a musl
+# system? Not evidence on its own — see is_musl.
+musl_filesystem() {
+  [ -f /etc/alpine-release ] || [ -e /lib/ld-musl-x86_64.so.1 ] || [ -e /lib/ld-musl-aarch64.so.1 ]
+}
 
 # Detect whether the Linux C library is musl (Alpine and friends) rather than glibc.
 # The two are NOT binary-compatible: a glibc binary aborts on a musl-only system before it
 # can even reach the keychain loader, so we ship a dedicated musl artifact.
-# The loader path is per-ARCHITECTURE, so probing only the x86_64 one silently answered "glibc"
-# on every musl ARM host. /etc/alpine-release and the ldd probe below cover Alpine either way;
-# the explicit paths are what catch non-Alpine musl distros with an uninformative ldd.
+#
+# The answer is permanent: `varsafe update` keeps the flavour of the binary it runs as, so the
+# first install's choice is the one that host keeps. Ask the C library itself first.
+# - glibc's getconf answers GNU_LIBC_VERSION ("glibc 2.36"); musl's does not know the variable.
+#   This comes before any file probe because a loader on disk proves nothing: Debian, Ubuntu and
+#   Arch all package musl (Rust developers install it to build static binaries), which puts
+#   /lib/ld-musl-x86_64.so.1 on a glibc system — and the musl build cannot start there.
+# - ldd names its libc. Capture FIRST, match second: musl's ldd exits non-zero for `--version`
+#   (it prints "musl libc (x86_64)" and returns 1), and under `set -o pipefail` a piped probe read
+#   that as failure, answering "glibc" on every host the probe was meant to catch.
 is_musl() {
-  [ -e /lib/ld-musl-x86_64.so.1 ] && return 0
-  [ -e /lib/ld-musl-aarch64.so.1 ] && return 0
-  [ -f /etc/alpine-release ] && return 0
+  local probe
+  probe=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+  case "$probe" in
+    glibc\ [0-9]*) return 1 ;;
+  esac
   if command -v ldd >/dev/null 2>&1; then
-    # Capture FIRST, match second. musl's own ldd exits non-zero for `--version` (verified on
-    # Alpine: it prints "musl libc (x86_64)" and returns 1), and `set -o pipefail` at the top of
-    # this script turns that into a failed probe even though the output says musl. So this
-    # last-resort check — the one that exists for musl distros without the standard loader path —
-    # answered "glibc" on every host it was meant to catch, and the installer would then download
-    # a glibc binary that cannot exec there.
-    local ldd_version
-    ldd_version=$(ldd --version 2>&1 || true)
-    printf '%s' "$ldd_version" | grep -qi musl && return 0
+    probe=$(ldd --version 2>&1 || true)
+    case "$probe" in
+      *musl*) return 0 ;;
+      *GNU*|*GLIBC*) return 1 ;;
+    esac
   fi
-  return 1
+  musl_filesystem
 }
 
 # Detect platform
@@ -110,6 +150,7 @@ detect_platform() {
   case "$(uname -s)" in
     Linux*)  os="linux" ;;
     Darwin*) os="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*) error "Unsupported OS: $(uname -s). On Windows, run this installer inside WSL." ;;
     *)       error "Unsupported OS: $(uname -s)" ;;
   esac
 
@@ -119,10 +160,17 @@ detect_platform() {
     *)            error "Unsupported architecture: $(uname -m)" ;;
   esac
 
+  # A terminal running under Rosetta 2 reports x86_64 on Apple silicon. The x64 build would run
+  # there translated, and stay: `varsafe update` picks by the architecture it runs as.
+  if [[ "$os" == "darwin" && "$arch" == "x64" ]] &&
+    [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" == "1" ]]; then
+    arch="arm64"
+  fi
+
   # Every Linux arch ships separate glibc and musl builds; pick by detected libc. Must stay in
   # lockstep with releaseArtifactName() in packages/cli/src/shared/domain/release-target.ts —
-  # this picks the FIRST install, that one picks every `varsafe update` afterwards, and a
-  # disagreement means an update silently swaps the binary for one the host cannot run.
+  # this picks the FIRST install, that one names the artifact for every `varsafe update`
+  # afterwards, and a disagreement means an update fetches a build the host cannot run.
   if [[ "$os" == "linux" ]] && is_musl; then
     echo "linux-${arch}-musl"
     return
@@ -207,7 +255,7 @@ smoke_test_binary() {
 
   case "$platform" in
     *-musl)
-      if echo "$out" | grep -qiE "libstdc\+\+|libgcc|shared library|symbol not found"; then
+      if grep -qiE "libstdc\+\+|libgcc|shared library|symbol not found" <<<"$out"; then
         if install_musl_prereqs && "$bin" --version >/dev/null 2>&1; then
           return 0
         fi
@@ -222,7 +270,7 @@ smoke_test_binary() {
   # guidance here so the install failure names the actual cause. Exit 126
   # ("found but cannot execute") is the primary, locale-independent signal;
   # the message grep is only a fallback for shells that report differently.
-  if [[ $status -eq 126 ]] || echo "$out" | grep -qi "permission denied"; then
+  if [[ $status -eq 126 ]] || grep -qi "permission denied" <<<"$out"; then
     error "The downloaded binary could not be executed:
 $(echo "$out" | sed 's/^/    /')
 
@@ -230,31 +278,43 @@ $(echo "$out" | sed 's/^/    /')
   to a directory on an exec-capable filesystem and re-run this installer."
   fi
 
-  error "The downloaded binary did not run on this system:
-$(echo "$out" | sed 's/^/    /')"
-}
+  # The status is a hint, not a diagnosis: a program can return any code. 127 is what the shell
+  # reports when the kernel cannot even start the file — its loader is missing.
+  local hint=""
+  if [[ $status -eq 127 ]]; then
+    hint="
 
-# Fetch content from URL
-fetch() {
-  local url="$1"
-  if command -v curl &>/dev/null; then
-    curl -fsSL "$url"
-  elif command -v wget &>/dev/null; then
-    wget -qO- "$url"
-  else
-    error "curl or wget is required"
+  Possible cause: this system cannot load ${platform} binaries — for example a
+  32-bit OS on a 64-bit CPU (uname -m reports $(uname -m)), or an unsupported C library."
+  elif [[ $status -gt 128 ]]; then
+    hint="
+
+  It was killed by signal $((status - 128))."
   fi
+  error "The downloaded binary did not run on this system:
+$(echo "$out" | sed 's/^/    /')${hint}"
 }
 
-# Download binary
+# Every transfer, with one policy:
+#   -q (first)       ~/.curlrc cannot alter or redirect what is downloaded (see the re-exec above).
+#   --proto =https   a redirect can never downgrade to plain HTTP.
+#   --retry 3        transient failures (timeouts, resets, 5xx) are retried...
+#   -o FILE          ...which is only safe into a file curl owns: curl truncates it before a retry,
+#                    while a body already written to a pipe or a shell redirect stays, and the
+#                    retried one is appended to it — a signature failure that reads as tampering.
+#   --speed-*        a stalled connection fails after a minute instead of hanging forever.
+# No --tlsv1.2: curl before 7.34 (RHEL 7, whose glibc can run varsafe) rejects the option, and
+# nothing rests on the TLS version — the release signature is what makes a download trustworthy.
+# A third argument shows a progress bar, when there is a terminal to draw it on.
 download() {
-  local url="$1"
-  local dest="$2"
-
-  if command -v curl &>/dev/null; then
-    curl -fsSL -o "$dest" "$url"
-  elif command -v wget &>/dev/null; then
-    wget -qO "$dest" "$url"
+  local url="$1" dest="$2" progress="${3:-}"
+  if command -v curl >/dev/null 2>&1; then
+    local display="-sS"
+    if [[ -n "$progress" && -t 2 ]]; then display="--progress-bar"; fi
+    curl -q --proto '=https' -fL "$display" --retry 3 --connect-timeout 20 \
+      --speed-limit 1 --speed-time 60 -o "$dest" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 60 -O "$dest" "$url"
   else
     error "curl or wget is required"
   fi
@@ -270,6 +330,14 @@ compute_sha256() {
   else
     error "Neither sha256sum nor shasum found; cannot verify download integrity"
   fi
+}
+
+# The download can only be checked with a SHA-256 tool, so find out before fetching 90 MB. (A
+# missing curl/wget surfaces on the first, tiny download; whether this machine can verify a
+# signature depends on the release, so verify_manifest decides that — also before the binary.)
+require_sha256_tool() {
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 ||
+    error "sha256sum or shasum is required to check the download"
 }
 
 # Base64 of the raw 32-byte Ed25519 release-signing public key.
@@ -288,27 +356,18 @@ RELEASE_SIGNING_SSH_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBH6AygZlfha
 # refuses a signature made under a different namespace, and only a listed principal is trusted.
 RELEASE_SIGNING_IDENTITY="varsafe-release@varsafe.dev"
 
-# Verify the downloaded binary against the SIGNED release manifest.
-#
-# `checksums.txt` was never evidence: it is served by the same bucket and CDN as the binary, so
-# whoever can replace one can replace the other, and this script would have cheerfully confirmed a
-# trojan against its own checksum. The signature is what an attacker who controls the bucket cannot
-# forge, and the manifest it covers is where the expected hash actually comes from.
-#
-# `varsafe update` has verified this way since cli-v6.0.1, and `release-cli` refuses to flip
-# `latest` unless the published signature verifies — so every release a user can reach carries one.
-# This closes the gap where the FIRST binary, the one that bootstraps that trust, was taken on faith.
-#
-# Fail-closed: a missing openssl, a missing signature, or a manifest that does not verify all abort
-# the install rather than falling back to the unsigned path.
-#
 # Having `openssl` on PATH is NOT the same as being able to verify: stock macOS ships LibreSSL as
-# /usr/bin/openssl, which has no Ed25519 EVP and no `pkeyutl -rawin`. Ask the tool what it can do.
+# /usr/bin/openssl, which has no Ed25519 EVP and no `pkeyutl -rawin`, and neither does OpenSSL
+# 1.1.1 (RHEL 8, Ubuntu 20.04). Ask the tool what it can do. $1 is the binary to ask: EPEL's
+# OpenSSL 3 for the RHEL 8 family installs as `openssl3`, beside the system's 1.1.1 `openssl`.
 openssl_can_verify_ed25519() {
-  local public_key_pem="$1"
-  command -v openssl &>/dev/null &&
-    openssl pkey -pubin -in "$public_key_pem" -noout >/dev/null 2>&1 &&
-    openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'
+  local openssl_bin="$1" public_key_pem="$2" help
+  command -v "$openssl_bin" &>/dev/null || return 1
+  "$openssl_bin" pkey -pubin -in "$public_key_pem" -noout >/dev/null 2>&1 || return 1
+  # Captured, then matched: `pkeyutl -help` exits non-zero on some builds, which a pipeline
+  # under pipefail would report as "cannot verify" even when the option is listed.
+  help=$("$openssl_bin" pkeyutl -help 2>&1 || true)
+  [[ "$help" == *-rawin* ]]
 }
 
 # What this machine has, for whoever has to fix it. $1 is why SSHSIG produced no verdict:
@@ -331,28 +390,38 @@ describe_verifiers() {
   echo "  openssl: $(command -v openssl) reports \"$(openssl version 2>&1 | head -1)\", which cannot verify Ed25519 signatures (needs OpenSSL 3)"
 }
 
-verify_release() {
-  local file="$1"
-  local binary_name="$2"
-  local version="$3"
+# Verify the SIGNED release manifest for version $2 and set EXPECTED_SHA256 to the checksum it lists
+# for artifact $1 — BEFORE the binary is downloaded. A machine that cannot verify, a pinned version
+# that does not exist and a manifest that does not verify all stop here, instead of after 90 MB was
+# fetched for nothing. Same order as `varsafe update`.
+#
+# `checksums.txt` was never evidence: it is served by the same bucket and CDN as the binary, so
+# whoever can replace one can replace the other, and this script would have cheerfully confirmed a
+# trojan against its own checksum. The signature is what an attacker who controls the bucket cannot
+# forge, and the manifest it covers is where the expected hash actually comes from.
+#
+# `varsafe update` has verified this way since cli-v6.0.1, and `release-cli` refuses to flip
+# `latest` unless the published signature verifies — so every release a user can reach carries one.
+# This closes the gap where the FIRST binary, the one that bootstraps that trust, was taken on faith.
+#
+# Fail-closed: no capable verifier, a missing signature, or a manifest that does not verify all
+# abort the install rather than falling back to the unsigned path.
+EXPECTED_SHA256=""
+verify_manifest() {
+  local binary_name="$1" version="$2"
+  local manifest="${WORK_DIR}/release.json"
 
-  local workdir
-  workdir="$(mktemp -d "${TMPDIR:-/tmp}/varsafe-verify.XXXXXX")" || {
-    error "Could not create a temporary directory for signature verification"
-  }
-
-  # Do not capture these in command substitutions: shells strip terminal newlines from
-  # substitution output, while an Ed25519 signature covers every manifest byte.
-  if ! fetch "${RELEASES_URL}/v${version}/release.json" > "${workdir}/release.json" 2>/dev/null; then
-    rm -rf "$workdir"
-    error "Could not fetch release.json for v${version}; aborting install"
+  # Downloaded to a file and verified from it, never captured in a command substitution: shells
+  # strip trailing newlines from substitution output, while an Ed25519 signature covers every byte.
+  if ! download "${RELEASES_URL}/v${version}/release.json" "$manifest" || [[ ! -s "$manifest" ]]; then
+    error "Could not fetch the release manifest for v${version}; nothing was installed.
+  If you set VARSAFE_VERSION, check that ${version} is a published release."
   fi
-  if [[ ! -s "${workdir}/release.json" ]]; then
-    rm -rf "$workdir"
-    error "Empty release manifest for v${version}; aborting install"
-  fi
 
-  local tampered="Release signature verification FAILED for v${version}.\n\nThe manifest served by the CDN is not signed by the varsafe release key.\nThis is what a tampered download looks like. Refusing to install."
+  local tampered="Release signature verification FAILED for v${version}.
+
+The manifest served by the CDN is not signed by the varsafe release key.
+This is what a tampered download looks like. Refusing to install."
   # Why the SSHSIG path did not produce a verdict, for the diagnosis if nothing else can either:
   # "missing" (this release publishes none), "unsupported" (OpenSSH older than SSHSIG), "none".
   local verified=1 sshsig_state="missing"
@@ -361,22 +430,21 @@ verify_release() {
   # publishes no .sshsig (everything before cli-v7.2.32) falls through to the OpenSSL path; a
   # .sshsig that does NOT verify is a definitive refusal, never a reason to try another verifier.
   if command -v ssh-keygen &>/dev/null &&
-    fetch "${RELEASES_URL}/v${version}/release.json.sshsig" > "${workdir}/release.json.sshsig" 2>/dev/null &&
-    [[ -s "${workdir}/release.json.sshsig" ]]; then
+    download "${RELEASES_URL}/v${version}/release.json.sshsig" "${WORK_DIR}/release.json.sshsig" 2>/dev/null &&
+    [[ -s "${WORK_DIR}/release.json.sshsig" ]]; then
     sshsig_state="none"
     printf '%s %s\n' "$RELEASE_SIGNING_IDENTITY" "$RELEASE_SIGNING_SSH_PUBLIC_KEY" \
-      > "${workdir}/allowed_signers"
+      > "${WORK_DIR}/allowed_signers"
     local ssh_error
-    if ssh_error=$(ssh-keygen -Y verify -f "${workdir}/allowed_signers" \
+    if ssh_error=$(ssh-keygen -Y verify -f "${WORK_DIR}/allowed_signers" \
       -I "$RELEASE_SIGNING_IDENTITY" -n "$RELEASE_SIGNING_IDENTITY" \
-      -s "${workdir}/release.json.sshsig" < "${workdir}/release.json" 2>&1 >/dev/null); then
+      -s "${WORK_DIR}/release.json.sshsig" < "$manifest" 2>&1 >/dev/null); then
       verified=0
     elif [[ "$ssh_error" == *"unknown option"* || "$ssh_error" == *"illegal option"* ]]; then
       # OpenSSH predating SSHSIG (before 8.1). That is a verifier this machine does not have, not
       # a verdict on the release: the raw signature below still decides.
       sshsig_state="unsupported"
     else
-      rm -rf "$workdir"
       error "$tampered"
     fi
   fi
@@ -387,77 +455,102 @@ verify_release() {
     # characters with no padding and simply concatenates. Pure text assembly — no xxd, no \xNN
     # escapes. Same construction as the release pipeline's own verification step.
     printf -- "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA%s\n-----END PUBLIC KEY-----\n" \
-      "$RELEASE_SIGNING_PUBLIC_KEY" > "${workdir}/pub.pem"
+      "$RELEASE_SIGNING_PUBLIC_KEY" > "${WORK_DIR}/pub.pem"
+
+    local openssl_bin="" candidate
+    for candidate in openssl openssl3; do
+      if openssl_can_verify_ed25519 "$candidate" "${WORK_DIR}/pub.pem"; then
+        openssl_bin="$candidate"
+        break
+      fi
+    done
 
     # No capable verifier is NOT evidence of tampering, and saying so sent every stock-macOS user a
     # security warning about a release that was fine. Say what is missing, and install nothing.
-    if ! openssl_can_verify_ed25519 "${workdir}/pub.pem"; then
-      local diagnosis
-      diagnosis="$(describe_verifiers "$sshsig_state")"
-      rm -rf "$workdir"
-      error "Cannot verify the release signature on this machine — nothing was installed.\n\n${diagnosis}\n\nInstall a verifier and re-run:\n  macOS:          OpenSSH 8.1+ (ships with 10.15+), or brew install openssl@3\n  Debian/Ubuntu:  apt install openssh-client   (or openssl)\n  Alpine:         apk add openssh-keygen       (or openssl)"
+    if [[ -z "$openssl_bin" ]]; then
+      error "Cannot verify the release signature on this machine — nothing was installed.
+
+$(describe_verifiers "$sshsig_state")
+
+Install a verifier and re-run:
+  macOS:              OpenSSH 8.1+ (ships with 10.15+), or OpenSSL 3 first on PATH
+  Debian/Ubuntu:      apt install openssh-client     (or openssl)
+  Fedora/RHEL 9+:     dnf install openssh            (or openssl)
+  RHEL/Rocky/Alma 8:  dnf install epel-release && dnf install openssl3
+  Alpine:             apk add openssh-keygen         (or openssl)"
     fi
 
-    if ! fetch "${RELEASES_URL}/v${version}/release.json.sig" > "${workdir}/sig.b64" 2>/dev/null ||
-      [[ ! -s "${workdir}/sig.b64" ]]; then
-      rm -rf "$workdir"
-      error "Could not fetch release.json.sig for v${version}; aborting install"
+    if ! download "${RELEASES_URL}/v${version}/release.json.sig" "${WORK_DIR}/sig.b64" ||
+      [[ ! -s "${WORK_DIR}/sig.b64" ]]; then
+      error "Could not fetch release.json.sig for v${version}; nothing was installed."
     fi
-    if openssl base64 -d -A -in "${workdir}/sig.b64" -out "${workdir}/sig.bin" >/dev/null 2>&1 &&
-      openssl pkeyutl -verify -pubin -inkey "${workdir}/pub.pem" -rawin \
-        -in "${workdir}/release.json" -sigfile "${workdir}/sig.bin" >/dev/null 2>&1; then
+    if "$openssl_bin" base64 -d -A -in "${WORK_DIR}/sig.b64" -out "${WORK_DIR}/sig.bin" >/dev/null 2>&1 &&
+      "$openssl_bin" pkeyutl -verify -pubin -inkey "${WORK_DIR}/pub.pem" -rawin \
+        -in "$manifest" -sigfile "${WORK_DIR}/sig.bin" >/dev/null 2>&1; then
       verified=0
     fi
     if [[ "$verified" -ne 0 ]]; then
-      rm -rf "$workdir"
       error "$tampered"
     fi
   fi
 
-  # Only now is the manifest trustworthy enough to take a hash from.
-  local expected
-  expected=$(grep -o "\"${binary_name}\"[[:space:]]*:[[:space:]]*\"[0-9a-f]\{64\}\"" "${workdir}/release.json" |
-    head -1 | grep -o '[0-9a-f]\{64\}')
-  rm -rf "$workdir"
-  if [[ -z "$expected" ]]; then
-    error "The signed manifest for v${version} lists no checksum for ${binary_name}; aborting install"
+  # Only now is the manifest trustworthy enough to read. Reading it whole is safe at this point:
+  # its bytes are verified, and a lost trailing newline changes no value. Matched with bash regexes
+  # rather than grep pipelines, whose early exit under pipefail aborted the script without a word.
+  local content signed_version="" version_re checksum_re
+  content=$(cat "$manifest")
+  version_re='"version"[[:space:]]*:[[:space:]]*"([^"]*)"'
+  if [[ "$content" =~ $version_re ]]; then signed_version="${BASH_REMATCH[1]}"; fi
+  # The signature proves varsafe published this manifest, not that it belongs to the version
+  # requested: version.txt and the path are unsigned, so whoever controls the CDN could serve an
+  # older, genuinely signed release under a newer path. The signed version binds them, as it does
+  # for `varsafe update`. (Nothing here can stop an older release being named as latest.)
+  if [[ "$signed_version" != "$version" ]]; then
+    error "The signed manifest served for v${version} is for version '${signed_version}'. Refusing to install it."
   fi
 
-  local actual
-  actual=$(compute_sha256 "$file")
-
-  if [[ "$actual" != "$expected" ]]; then
-    error "Checksum mismatch for ${binary_name}!\n  Expected: ${expected}\n  Got:      ${actual}\n\nThe signed manifest and the downloaded binary disagree. Refusing to install."
+  checksum_re="\"${binary_name}\"[[:space:]]*:[[:space:]]*\"([0-9a-f]{64})\""
+  EXPECTED_SHA256=""
+  if [[ "$content" =~ $checksum_re ]]; then EXPECTED_SHA256="${BASH_REMATCH[1]}"; fi
+  if [[ -z "$EXPECTED_SHA256" ]]; then
+    error "The signed manifest for v${version} lists no checksum for ${binary_name}; nothing was installed."
   fi
+}
 
-  success "Signature and checksum verified"
+# A release version as published: 7.2.32, or a prerelease such as 8.0.0-rc.1. It becomes part of
+# `${RELEASES_URL}/v<version>/<artifact>`, so it is validated rather than pasted into a URL — a
+# value like `../..` would otherwise walk out of the release path and fetch something else entirely.
+is_version() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
 }
 
 # Which version to install: the pin if the caller set one, else whatever `latest` points at.
 #
 # VARSAFE_VERSION exists for two jobs the installer could not do before: reinstalling a known-good
 # release after a bad one, and letting CI prove a just-published version installs BEFORE `latest`
-# is flipped to it. The value becomes part of `${RELEASES_URL}/v<version>/<artifact>`, so it is
-# validated as a version rather than pasted into a URL — a pin like `../..` would otherwise walk
-# out of the release path and fetch something else entirely.
+# is flipped to it. What `latest` names is checked the same way: a proxy or portal answering in its
+# place would otherwise turn into a confusing download failure.
 resolve_version() {
+  local version
   if [[ -n "${VARSAFE_VERSION:-}" ]]; then
-    if [[ ! "$VARSAFE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-      error "VARSAFE_VERSION is not a version: '${VARSAFE_VERSION}'.\n\nUse a released version such as VARSAFE_VERSION=7.2.32, or leave it unset to install the latest."
+    if ! is_version "$VARSAFE_VERSION"; then
+      error "VARSAFE_VERSION is not a version: '${VARSAFE_VERSION}'.
+
+Use a released version such as VARSAFE_VERSION=7.2.32 (no leading v), or leave it unset to install the latest."
     fi
     printf '%s' "$VARSAFE_VERSION"
     return
   fi
-  get_latest_version
-}
-
-# Get latest version from CDN
-get_latest_version() {
-  local version
-  version=$(fetch "${RELEASES_URL}/latest/version.txt" 2>/dev/null) || {
-    error "Could not fetch latest version from CDN"
-  }
-  echo "$version"
+  if ! download "${RELEASES_URL}/latest/version.txt" "${WORK_DIR}/version.txt"; then
+    error "Could not fetch the latest version from ${RELEASES_URL}/latest/version.txt.
+  Check your connection or proxy, then re-run this installer."
+  fi
+  version=$(tr -d '[:space:]' < "${WORK_DIR}/version.txt")
+  if ! is_version "$version"; then
+    error "${RELEASES_URL}/latest/version.txt did not return a version (got '$(printf '%s' "$version" | head -c 40)').
+  A proxy or captive portal may be answering instead of the release server."
+  fi
+  printf '%s' "$version"
 }
 
 # Check if running interactively
@@ -492,7 +585,7 @@ prompt_yes_no_tty() {
   if ! { : < /dev/tty; } 2>/dev/null; then
     return 1
   fi
-  echo -en "${CYAN}?${NC} $prompt ${GREEN}[y/N]${NC} " > /dev/tty
+  printf '%s?%s %s %s[y/N]%s ' "$CYAN" "$NC" "$prompt" "$GREEN" "$NC" > /dev/tty
   # -t 60: a CI runner can allocate a PTY nobody is attached to; without a
   # timeout the read blocks the job forever. Timeout = no, same as no terminal.
   read -r -t 60 response < /dev/tty || return 1
@@ -522,6 +615,41 @@ tighten_default_dir() {
 # default (via /dev/tty) or a refusal with the fix — silently relocating a
 # secrets binary is worse than failing.
 ensure_install_dir() {
+  # The directory ends up on PATH, through a line in a shell rc file, so it must be one PATH can
+  # hold. Absolute: a relative entry is resolved against whatever directory the shell is in, so
+  # commands would be looked up in every directory the user cds into. No ':', PATH's separator,
+  # which no quoting protects. And none of the characters a double-quoted rc line would expand or
+  # end on — the rc file is shell code, run at every login.
+  case "$INSTALL_DIR" in
+    /*) ;;
+    *) error "The install directory must be an absolute path, not '$INSTALL_DIR'. Set VARSAFE_INSTALL_DIR to a full path, e.g. \$HOME/bin." ;;
+  esac
+  case "$INSTALL_DIR" in
+    *[\"\$\`\\:]*|*"
+"*)
+      error "The install directory '$INSTALL_DIR' cannot be put on PATH: it contains one of : \" \$ \` \\ or a newline. Choose another with VARSAFE_INSTALL_DIR." ;;
+  esac
+
+  # `curl … | sudo bash` keeps the invoking user's HOME on macOS, whose sudoers keeps it, and under
+  # `sudo -E`: root would create a root-owned 0700 ~/.varsafe/bin inside that user's home, which the
+  # user can neither enter nor update, and edit their shell rc as root. Keyed on sudo/doas having
+  # run us, not on ownership alone: CI containers commonly run as root with a HOME someone else owns.
+  if [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" && "$(id -u)" -eq 0 && -n "${SUDO_USER:-}${DOAS_USER:-}" ]] &&
+    [[ -d "$HOME" && ! -O "$HOME" ]]; then
+    error "Run this installer without sudo: it installs varsafe for your own user, in ~/.varsafe/bin.
+  To install for every user instead, choose a system directory explicitly:
+      curl -fsSL https://varsafe.dev/install.sh | sudo VARSAFE_INSTALL_DIR=/usr/local/bin bash"
+  fi
+
+  # ~/.varsafe is the CLI's own directory, kept 0700 because it holds the credential store — but
+  # only once the CLI first opens it. Created here with the umask's permissions, it let anyone in a
+  # shared group swap the directory holding the binary before varsafe ever ran. `mkdir -m` creates
+  # it private in one step, and fails on anything already there, a symlink included: nothing is
+  # chmodded through a path that could be swapped between a check and the change.
+  if [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" ]]; then
+    mkdir -m 700 "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+  fi
+
   if dir_writable "$INSTALL_DIR"; then
     if [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" ]]; then
       tighten_default_dir
@@ -565,7 +693,7 @@ prompt_yes_no() {
     return 0  # Default to yes in non-interactive mode
   fi
 
-  echo -en "${CYAN}?${NC} $prompt ${GREEN}[Y/n]${NC} "
+  printf '%s?%s %s %s[Y/n]%s ' "$CYAN" "$NC" "$prompt" "$GREEN" "$NC"
   read -r response
   case "$response" in
     [nN]|[nN][oO]) return 1 ;;
@@ -585,7 +713,8 @@ get_shell_config() {
   shell_name=$(basename "${SHELL:-/bin/bash}")
 
   case "$shell_name" in
-    zsh)  echo "$HOME/.zshrc" ;;
+    # zsh reads its rc files from ZDOTDIR when that is set.
+    zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
     bash)
       # Prefer .bashrc, fall back to .bash_profile on macOS
       if [[ -f "$HOME/.bashrc" ]]; then
@@ -599,6 +728,40 @@ get_shell_config() {
     fish) echo "$HOME/.config/fish/config.fish" ;;
     *)    echo "" ;;
   esac
+}
+
+# The rc-file line that puts INSTALL_DIR on PATH, for shell $1 — the directory actually installed
+# into. A directory under $HOME is written $HOME-relative, so a synced rc file still works on a
+# machine whose home directory has a different path. Quoting is safe: ensure_install_dir refused
+# every character a double-quoted string would interpret.
+path_line() {
+  local shell_name="$1" entry="$INSTALL_DIR"
+  if [[ "$shell_name" == "fish" ]]; then
+    printf 'fish_add_path "%s"\n' "$INSTALL_DIR"
+    return
+  fi
+  if [[ -n "${HOME:-}" && "$INSTALL_DIR" == "$HOME/"* ]]; then
+    entry="\$HOME/${INSTALL_DIR#"$HOME"/}"
+  fi
+  printf 'export PATH="%s:$PATH"\n' "$entry"
+}
+
+# Does rc file $1 already put INSTALL_DIR on PATH for shell $2? An uncommented line must be the one
+# this installer writes (or the unquoted fish line earlier versions wrote) — or, for the default
+# directory, which people also add by hand, name it as a whole PATH entry: absolutely, or as
+# $HOME/…, ${HOME}/… or ~/…. Never a bare substring: keyed on the default, every re-run with a
+# custom VARSAFE_INSTALL_DIR appended another line, and keyed on part of the path, $HOME/bin
+# matched /usr/local/bin and was left off PATH.
+rc_has_install_dir() {
+  local rc="$1" shell_name="$2" lines words
+  lines=$(grep -v '^[[:space:]]*#' "$rc" 2>/dev/null || true)
+  if grep -qxF -e "$(path_line "$shell_name")" -e "fish_add_path $INSTALL_DIR" <<<"$lines"; then
+    return 0
+  fi
+  [[ "$INSTALL_DIR" == "$DEFAULT_INSTALL_DIR" ]] || return 1
+  # Split at the characters that delimit a PATH entry, so only a whole entry can match.
+  words=$(tr '=:"'"'"'()[:space:]' '\n' <<<"$lines")
+  grep -qxF -e "$INSTALL_DIR" -e '$HOME/.varsafe/bin' -e '${HOME}/.varsafe/bin' -e '~/.varsafe/bin' <<<"$words"
 }
 
 # Configure PATH
@@ -620,23 +783,18 @@ configure_path() {
     fi
   fi
 
-  # Check if PATH is already configured in shell rc
-  if [[ -n "$shell_rc" ]] && grep -qF ".varsafe/bin" "$shell_rc" 2>/dev/null; then
+  if [[ -n "$shell_rc" ]] && rc_has_install_dir "$shell_rc" "$shell_name"; then
     info "PATH already configured in $shell_rc"
     print_reload_instructions "$shell_rc"
     return 0
   fi
 
   # Ask to add to PATH (or auto-add in non-interactive mode)
-  if [[ -n "$shell_rc" ]]; then
-    if prompt_yes_no "Add varsafe to PATH in $shell_rc?"; then
-      add_to_shell_config "$shell_name" "$shell_rc"
-      print_reload_instructions "$shell_rc"
-    else
-      print_manual_instructions "$shell_name"
-    fi
+  if [[ -n "$shell_rc" ]] && prompt_yes_no "Add varsafe to PATH in $shell_rc?"; then
+    add_to_shell_config "$shell_name" "$shell_rc"
+    print_reload_instructions "$shell_rc"
   else
-    print_manual_instructions "$shell_name"
+    print_manual_instructions "$shell_name" "$shell_rc"
   fi
 }
 
@@ -645,21 +803,8 @@ add_to_shell_config() {
   local shell_name="$1"
   local shell_rc="$2"
 
-  if [[ "$shell_name" == "fish" ]]; then
-    mkdir -p "$(dirname "$shell_rc")"
-    echo "" >> "$shell_rc"
-    echo "# Varsafe CLI" >> "$shell_rc"
-    echo "fish_add_path $INSTALL_DIR" >> "$shell_rc"
-  else
-    # The directory that was actually installed into — VARSAFE_INSTALL_DIR was previously ignored
-    # here, so a custom install put a path on PATH that nothing had been written to. Keep it
-    # $HOME-relative when it is under $HOME, so a synced rc file still works on another machine.
-    local path_entry="$INSTALL_DIR"
-    [[ "$INSTALL_DIR" == "$HOME/"* ]] && path_entry="\$HOME/${INSTALL_DIR#"$HOME"/}"
-    echo "" >> "$shell_rc"
-    echo "# Varsafe CLI" >> "$shell_rc"
-    echo "export PATH=\"${path_entry}:\$PATH\"" >> "$shell_rc"
-  fi
+  mkdir -p "$(dirname "$shell_rc")"
+  printf '\n# Varsafe CLI\n%s\n' "$(path_line "$shell_name")" >> "$shell_rc"
   success "Added varsafe to $shell_rc"
 }
 
@@ -668,42 +813,21 @@ print_reload_instructions() {
   local shell_rc="$1"
 
   echo ""
-  echo -e "  ${GREEN}Almost there!${NC} To start using varsafe:"
-  echo ""
-  echo -e "  ${CYAN}Option 1:${NC} Reload your shell config"
-  echo -e "           ${GREEN}source ${shell_rc}${NC}"
-  echo ""
-  echo -e "  ${CYAN}Option 2:${NC} Open a new terminal window"
-  echo ""
+  printf '  %sAlmost there!%s To start using varsafe:\n\n' "$GREEN" "$NC"
+  printf '  %sOption 1:%s Reload your shell config\n' "$CYAN" "$NC"
+  printf '           %ssource %s%s\n\n' "$GREEN" "$shell_rc" "$NC"
+  printf '  %sOption 2:%s Open a new terminal window\n\n' "$CYAN" "$NC"
 }
 
-# Print manual instructions when user declines auto-config
+# Print manual instructions when user declines auto-config, or the shell is one we do not edit.
+# The line names the directory actually installed into, not the default.
 print_manual_instructions() {
-  local shell_name="$1"
+  local shell_name="$1" shell_rc="$2"
 
   echo ""
-  echo -e "${YELLOW}To add varsafe to your PATH, run:${NC}"
-  echo ""
-
-  case "$shell_name" in
-    zsh)
-      echo -e "  ${GREEN}echo 'export PATH=\"\$HOME/.varsafe/bin:\$PATH\"' >> ~/.zshrc${NC}"
-      echo -e "  ${GREEN}source ~/.zshrc${NC}"
-      ;;
-    bash)
-      echo -e "  ${GREEN}echo 'export PATH=\"\$HOME/.varsafe/bin:\$PATH\"' >> ~/.bashrc${NC}"
-      echo -e "  ${GREEN}source ~/.bashrc${NC}"
-      ;;
-    fish)
-      echo -e "  ${GREEN}fish_add_path ~/.varsafe/bin${NC}"
-      ;;
-    *)
-      echo -e "  ${GREEN}export PATH=\"\$HOME/.varsafe/bin:\$PATH\"${NC}"
-      echo ""
-      echo "  Add the above line to your shell config file."
-      ;;
-  esac
-  echo ""
+  printf '%sTo add varsafe to your PATH, add this line to %s:%s\n\n' \
+    "$YELLOW" "${shell_rc:-your shell config file}" "$NC"
+  printf '  %s%s%s\n\n' "$GREEN" "$(path_line "$shell_name")" "$NC"
 }
 
 main() {
@@ -730,10 +854,13 @@ main() {
       ;;
   esac
 
+  require_sha256_tool
+
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/varsafe-install.XXXXXX")" ||
+    error "Could not create a temporary directory in ${TMPDIR:-/tmp}"
+  trap cleanup EXIT
+
   version=$(resolve_version)
-  if [[ -z "$version" ]]; then
-    error "Could not determine latest version"
-  fi
   if [[ -n "${VARSAFE_VERSION:-}" ]]; then
     info "Pinned version: v$version"
   else
@@ -743,39 +870,42 @@ main() {
   binary_name="varsafe-${platform}"
   download_url="${RELEASES_URL}/v${version}/${binary_name}"
 
-  # Download binary (directory writability and permissions were settled by
-  # ensure_install_dir before any network I/O)
-  info "Downloading ${binary_name}..."
-  local tmp_binary
-  tmp_binary="$(mktemp "${INSTALL_DIR}/.varsafe.XXXXXX")"
-  trap 'rm -f "$tmp_binary"' EXIT
+  # The signed manifest first: it decides whether this machine can verify the release at all, and
+  # whether the version exists, before the binary is fetched.
+  verify_manifest "$binary_name" "$version"
 
-  if ! download "$download_url" "$tmp_binary"; then
-    error "Failed to download from CDN"
+  # Directory writability and permissions were settled by ensure_install_dir before any network
+  # I/O. The binary lands in a temporary file beside its destination, so the final mv is a rename.
+  info "Downloading ${binary_name}..."
+  TMP_BINARY="$(mktemp "${INSTALL_DIR}/.varsafe.XXXXXX")"
+  if ! download "$download_url" "$TMP_BINARY" progress; then
+    error "Failed to download ${download_url}"
   fi
 
-  # Verify the signed manifest, then the binary's hash against it
-  verify_release "$tmp_binary" "$binary_name" "$version"
+  local actual
+  actual=$(compute_sha256 "$TMP_BINARY")
+  if [[ "$actual" != "$EXPECTED_SHA256" ]]; then
+    error "Checksum mismatch for ${binary_name}!
+  Expected: ${EXPECTED_SHA256}
+  Got:      ${actual}
 
-  chmod 755 "$tmp_binary"
+The signed manifest and the downloaded binary disagree. Refusing to install."
+  fi
+  success "Signature and checksum verified"
+
+  chmod 755 "$TMP_BINARY"
 
   # Prove it runs BEFORE putting it on PATH. Verified bytes are not the same as a usable binary.
-  smoke_test_binary "$tmp_binary" "$platform"
+  smoke_test_binary "$TMP_BINARY" "$platform"
 
-  mv "$tmp_binary" "$INSTALL_DIR/varsafe"
-  trap - EXIT
+  mv "$TMP_BINARY" "$INSTALL_DIR/varsafe"
+  TMP_BINARY=""
 
-  success "Installed varsafe to $INSTALL_DIR/varsafe"
+  local installed_version
+  installed_version=$("$INSTALL_DIR/varsafe" --version 2>/dev/null || echo "$version")
+  success "Installed varsafe ${installed_version} to $INSTALL_DIR/varsafe"
 
-  # Configure PATH
   configure_path
-
-  # Verify installation
-  if [[ -x "$INSTALL_DIR/varsafe" ]]; then
-    local installed_version
-    installed_version=$("$INSTALL_DIR/varsafe" --version 2>/dev/null || echo "unknown")
-    success "Installed varsafe $installed_version"
-  fi
 
   echo ""
   echo "  Get started:"

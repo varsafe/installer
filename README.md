@@ -19,9 +19,9 @@ here only after it has passed review there.
 - **It verifies the release before installing it.** Every release publishes a manifest
   (`release.json`) signed with varsafe's Ed25519 release key, in two encodings: an OpenSSH signature
   (`release.json.sshsig`, checked with `ssh-keygen -Y verify`) and a raw signature
-  (`release.json.sig`, checked with `openssl pkeyutl`). The installer verifies the manifest, then
-  checks the downloaded binary's SHA-256 against it. The public key is pinned in `install.sh` in both
-  encodings, and the test suite asserts they are the same 32 bytes.
+  (`release.json.sig`, checked with `openssl pkeyutl`). The installer verifies the manifest before
+  it downloads the binary, then checks the binary's SHA-256 against it. The public key is pinned in
+  `install.sh` in both encodings, and the test suite asserts they are the same 32 bytes.
 - **It refuses rather than guesses.** A checksum mismatch, a signature that does not verify, a
   truncated download, an unsupported architecture, a directory it cannot write — each is a refusal
   with the reason, and nothing is installed.
@@ -33,13 +33,17 @@ here only after it has passed review there.
 ## Installing a specific version
 
 ```sh
-VARSAFE_VERSION=7.2.32 curl -fsSL https://varsafe.dev/install.sh | bash
+curl -fsSL https://varsafe.dev/install.sh | VARSAFE_VERSION=7.2.32 bash
 ```
 
-Useful for pinning in CI, or for putting a known-good version back. The value is validated as a
-version before it is used, so it cannot walk out of the release path.
+The variable goes on `bash`, the command that runs the installer: placed before `curl`, it would
+reach only the download, and the latest release would be installed instead.
 
-Choose the directory with `VARSAFE_INSTALL_DIR` (default `~/.varsafe/bin`).
+Useful for pinning in CI, or for putting a known-good version back. The value is validated as a
+version before it is used, so it cannot walk out of the release path, and the signed manifest must
+name that exact version: a pinned install gets the release it asked for, or nothing.
+
+Choose the directory with `VARSAFE_INSTALL_DIR`, as an absolute path (default `~/.varsafe/bin`).
 
 ## Running the tests
 
@@ -47,9 +51,10 @@ Choose the directory with `VARSAFE_INSTALL_DIR` (default `~/.varsafe/bin`).
 bash scripts/test-install-sh.sh
 ```
 
-No network and no real install: the suite drives the installer's own functions against a fake CDN,
-with real Ed25519 fixtures, and builds a PATH holding exactly the tools a given machine has — so it
-can ask what happens on a host whose openssl cannot verify, or whose `ssh-keygen` predates SSHSIG.
+No network and no real install: the suite drives the installer — its functions, and the whole
+script end to end — against a fake CDN, with real Ed25519 fixtures, and builds a PATH holding exactly
+the tools a given machine has — so it can ask what happens on a host whose openssl cannot verify, or
+whose `ssh-keygen` predates SSHSIG.
 
 A case a host genuinely cannot exercise (no bash-free POSIX shell for the `curl | sh` re-exec path,
 no openssl that can sign Ed25519 for the fixtures) reports as `skip` with the reason rather than as a
